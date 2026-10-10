@@ -1,0 +1,60 @@
+// Замените ВЕСЬ код файла Код.gs этим кодом. Затем обновите развёртывание.
+const HEADERS=['Дата и время','Имя и фамилия','Присутствие','С парой','Имя пары','С детьми','Имена детей','Взрослых','Детей','ID ответа'];
+
+function doPost(e){
+  const lock=LockService.getScriptLock();
+  try{
+    lock.waitLock(20000);
+    const data=JSON.parse((e.parameter&&e.parameter.payload)||'{}');
+    if(data.website) return json_({ok:true}); // скрытое поле-ловушка
+    const name=clean_(data.name,120);
+    const id=clean_(data.submissionId,100);
+    const attendance=data.attendance;
+    if(!name||!id||!['yes','no'].includes(attendance)) throw Error('Некорректная анкета');
+    const coming=attendance==='yes';
+    const partner=coming&&data.partner==='yes';
+    const withChildren=coming&&data.children==='yes';
+    if(coming&&!['yes','no'].includes(data.partner))throw Error('Не указан ответ о паре');
+    if(coming&&!['yes','no'].includes(data.children))throw Error('Не указан ответ о детях');
+    const partnerName=partner?clean_(data.partnerName,120):'';
+    const childrenNames=withChildren&&Array.isArray(data.childrenNames)
+      ?data.childrenNames.slice(0,15).map(x=>clean_(x,120)).filter(Boolean):[];
+    if(partner&&!partnerName)throw Error('Не указано имя пары');
+    if(withChildren&&!childrenNames.length)throw Error('Не указаны дети');
+    const sheet=SpreadsheetApp.getActiveSpreadsheet().getSheets()[0];
+    if(sheet.getLastRow()===0)sheet.appendRow(HEADERS);
+    // Повторное нажатие / повторная отправка того же ID не создаёт дубликат.
+    const last=sheet.getLastRow();
+    if(last>1){
+      const ids=sheet.getRange(2,10,last-1,1).getDisplayValues().flat();
+      if(ids.includes(id))return json_({ok:true,duplicate:true});
+    }
+    const adults=coming?(partner?2:1):0;
+    sheet.appendRow([new Date(),safeCell_(name),coming?'Да':'Нет',partner?'Да':'Нет',
+      safeCell_(partnerName),withChildren?'Да':'Нет',safeCell_(childrenNames.join(', ')),
+      adults,childrenNames.length,id]);
+    const props=PropertiesService.getScriptProperties();
+    const token=props.getProperty('TELEGRAM_BOT_TOKEN');
+    const chatId=props.getProperty('TELEGRAM_CHAT_ID');
+    if(token&&chatId){
+      const msg='💌 Новый ответ на приглашение!\n\n'+
+        '👤 Гость: '+name+'\n'+
+        '💍 Придёт: '+(coming?'Да':'Нет')+'\n'+
+        '🤍 Пара: '+(partner?partnerName:'Нет')+'\n'+
+        '👶 Дети: '+(childrenNames.join(', ')||'Нет')+'\n'+
+        '👥 Взрослых: '+adults+'; детей: '+childrenNames.length;
+      try{
+        const response=UrlFetchApp.fetch('https://api.telegram.org/bot'+token+'/sendMessage',{
+          method:'post',contentType:'application/json',
+          payload:JSON.stringify({chat_id:chatId,text:msg}),muteHttpExceptions:true
+        });
+        if(response.getResponseCode()!==200)console.error('Telegram: '+response.getContentText());
+      }catch(err){console.error('Telegram: '+err)}
+    }
+    return json_({ok:true});
+  }catch(err){console.error(err);return json_({ok:false,error:String(err)})}
+  finally{try{lock.releaseLock()}catch(e){}}
+}
+function clean_(value,max){return String(value||'').trim().slice(0,max)}
+function safeCell_(value){return /^[=+\-@]/.test(value)?"'"+value:value}
+function json_(data){return ContentService.createTextOutput(JSON.stringify(data)).setMimeType(ContentService.MimeType.JSON)}
